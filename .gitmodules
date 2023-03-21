@@ -13,3 +13,9 @@
 [submodule "lib/solmate"]
 	path = lib/solmate
 	url = https://github.com/transmissions11/solmate
+[submodule "lib/ERC721A"]
+	path = lib/ERC721A
+	url = git@github.com:chiru-labs/ERC721A.git
+[submodule "lib/operator-filter-registry"]
+	path = lib/operator-filter-registry
+	url = git@github.com:ProjectOpenSea/operator-filter-registry.git

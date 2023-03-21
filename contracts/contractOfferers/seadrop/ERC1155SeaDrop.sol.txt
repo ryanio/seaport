@@ -1,0 +1,325 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import { TokenContractMetadata } from "./lib/TokenContractMetadata.sol";
+
+import { OnlyAllowedSeaDrop } from "./lib/OnlyAllowedSeaDrop.sol";
+
+import { ERC1155 } from "@rari-capital/solmate/src/tokens/ERC1155.sol";
+
+/**
+ * @title  ERC1155SeaDrop
+ * @author Ryan Ghods (ralxz.eth)
+ * @notice An ERC-1155 token contract that is compatible to mint with the
+ *         SeaDrop contract offerer.
+ */
+contract ERC1155SeaDrop is ERC1155, OnlyAllowedSeaDrop, TokenContractMetadata {
+    /// @notice The total token supply per token id.
+    ///         Subtracted when an item is burned.
+    mapping(uint256 => uint256) _totalSupply;
+
+    /// @notice The total number of tokens minted per token id.
+    mapping(uint256 => uint256) _totalMinted;
+
+    /// @notice The total number of tokens minted per token id per address.
+    mapping(uint256 => mapping(address => uint256)) _totalMintedByUser;
+
+    /// @notice The max token supply per token id.
+    mapping(uint256 => uint256) _maxSupply;
+
+    /// @notice An optional base URI
+    string private _baseURI;
+
+    /// @notice An optional mapping for token URIs
+    mapping(uint256 => string) private _tokenURIs;
+
+    /**
+     * @notice Deploy the token contract with its name, symbol,
+     *         and allowed SeaDrop addresses.
+     */
+    constructor(
+        string memory name,
+        string memory symbol,
+        address[] memory allowedSeaDrop
+    ) ERC1155(name, symbol) OnlyAllowedSeaDrop(allowedSeaDrop) {
+        // Emit an event noting the contract deployment.
+        emit SeaDropTokenDeployed();
+    }
+
+    /**
+     * @notice Returns the token URI for the given token ID.
+     *
+     * @param tokenId The token ID to get the URI for.
+     */
+    function uri(
+        uint256 tokenId
+    ) public view virtual override returns (string memory) {
+        // Get the token URI.
+        string memory tokenURI = _tokenURIs[tokenId];
+
+        // Concatenate base URI and tokenURI.
+        return string.concat(_baseURI, tokenURI);
+    }
+
+    /**
+     * @dev Sets `tokenURI` as the tokenURI of `tokenId`.
+     *      Note this gets combined with _baseURI.
+     *
+     * @param tokenId The token ID to set.
+     * @param tokenURI the token URI to set.
+     */
+    function setURI(uint256 tokenId, string memory tokenURI) external override {
+        // Get the token URI.
+        _tokenURIs[tokenId] = tokenURI;
+
+        // Emit an event containing the token URI update.
+        emit URI(uri(tokenId), tokenId);
+    }
+
+    /**
+     * @dev Sets `baseURI` as the `_baseURI` for all tokens.
+     *      Note this gets prepended to all set token URIs.
+     *
+     * @param newBaseURI The new base URI to set.
+     */
+    function setBaseURI(string memory newBaseURI) external override {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        // Set the new base URI.
+        _baseURI = newBaseURI;
+    }
+
+    /**
+     * @notice Sets the base URI for the token metadata and emits an event.
+     *
+     * @param newBaseURI The new base URI to set.
+     */
+    function setBaseURI(string calldata newBaseURI) external override {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        // Set the new base URI.
+        _tokenBaseURI = newBaseURI;
+
+        // Emit an event with the update.
+        if (totalSupply() != 0) {
+            emit BatchMetadataUpdate(1, _nextTokenId() - 1);
+        }
+    }
+
+    /**
+     * @notice Sets the max token supply and emits an event.
+     *
+     * @param newMaxSupply The new max supply to set.
+     */
+    function setMaxSupply(uint256 newMaxSupply) external {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        // Ensure the max supply does not exceed the maximum value of uint64.
+        if (newMaxSupply > 2 ** 64 - 1) {
+            revert CannotExceedMaxSupplyOfUint64(newMaxSupply);
+        }
+
+        // Set the new max supply.
+        _maxSupply = newMaxSupply;
+
+        // Emit an event with the update.
+        emit MaxSupplyUpdated(newMaxSupply);
+    }
+
+    /**
+     * @notice Mint tokens, restricted to the SeaDrop contract.
+     *
+     * @param minter   The address to mint to.
+     * @param tokenIds The tokenIds to mint.
+     * @param amounts  The amounts to mint per token id.
+     *                 For ERC-721 if tokenIds is empty, meaning no specific
+     *                 token IDs are specified, then amounts should be
+     *                 length 1 of total number of tokens to mint.
+     */
+    function mintSeaDrop(
+        address minter,
+        uint256[] tokenIds,
+        uint256[] amounts
+    ) external virtual override nonReentrant {
+        // Ensure the SeaDrop is allowed.
+        _onlyAllowedSeaDrop(msg.sender);
+
+        // Put the tokenIds length on the stack.
+        uint256 tokenIdsLength = tokenIds.length;
+
+        // Ensure the tokenIds and amounts are the same length.
+        if (tokenIdsLength != amounts.length) {
+            revert TokenIdsAndAmountsMustBeSameLength(
+                tokenIds.length,
+                amounts.length
+            );
+        }
+
+        // Mint the quantity of tokens to the minter.
+        for (uint256 i = 0; i < tokenIdsLength; ) {
+            uint256 tokenId = tokenIds[i];
+            uint256 amount = amounts[i];
+
+            // Extra safety check to ensure the max supply is not exceeded.
+            if (_totalMinted[tokenId] + amount > maxSupply(tokenId)) {
+                revert MintQuantityExceedsMaxSupply(
+                    _totalMinted[tokenId] + amount,
+                    maxSupply(tokenId)
+                );
+            }
+
+            // Increment the total minted and supply.
+            _totalMinted[tokenId] += amount;
+            _totalMintedByUser[tokenId][minter] += amount;
+            _totalSupply[tokenId] += amount;
+
+            // Mint the tokens.
+            _batchMint(minter, tokenIds, amounts, "");
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Burns a batch of tokens, restricted to the owner or approved operator.
+     *
+     * @param from The address to burn from.
+     * @param ids  The token IDs to burn.
+     * @param amounts The amounts to burn per token ID.
+     */
+    function batchBurn(
+        address from,
+        uint256[] memory ids,
+        uint256[] memory amounts
+    ) internal virtual {
+        // Require that only the owner or approved operator can call.
+        require(
+            msg.sender == from || isApprovedForAll[from][msg.sender],
+            "NOT_AUTHORIZED"
+        );
+
+        // Ensure the balances are sufficient.
+        uint256 idsLength = ids.length;
+        uint256 balances = balanceOfBatch(from, ids);
+        for (uint256 i = 0; i < idsLength; ) {
+            require(balances[i] >= amounts[i], "INSUFFICIENT_BALANCE");
+            unchecked {
+                ++i;
+            }
+
+            // Subtract from the total supply for the token ID.
+            _totalSupply[ids[i]] -= amounts[i];
+        }
+
+        // Burn the tokens.
+        _batchBurn(from, ids, amounts);
+    }
+
+    /**
+     * @notice Burns a token, restricted to the owner or approved operator.
+     *
+     * @param id The token id to burn.
+     */
+    function burn(address from, uint256 id, uint256 amount) internal virtual {
+        // Require that only the owner or approved operator can call.
+        require(
+            msg.sender == from || isApprovedForAll[from][msg.sender],
+            "NOT_AUTHORIZED"
+        );
+
+        // Ensure the balance is sufficient.
+        require(balanceOf(from, id) >= amount, "INSUFFICIENT_BALANCE");
+
+        // Subtract from the total supply for the token ID.
+        _totalSupply[id] -= amount;
+
+        // Burn the token.
+        _burn(from, id, amount);
+    }
+
+    /**
+     * @notice Returns the max supply for the given token ID.
+     *
+     * @param tokenId The token ID to get the max supply for.
+     */
+    function maxSupply(
+        uint256 tokenId
+    ) external view override returns (uint256) {
+        return _maxSupply[tokenId];
+    }
+
+    /**
+     * @notice Returns the total number of items minted for the given token ID.
+     */
+    function totalMinted(
+        uint256 tokenId
+    ) external view override returns (uint256) {
+        return _totalMinted[tokenId];
+    }
+
+    /**
+     * @notice Returns the total supply for the given token ID.
+     *         Subtracted when an item is burned.
+     */
+    function totalSupply(
+        uint256 tokenId
+    ) external view override returns (uint256) {
+        return _totalSupply[tokenId];
+    }
+
+    /**
+     * @notice Returns the base URI for token metadata.
+     */
+    function baseURI() external view override returns (string memory) {
+        return _baseURI();
+    }
+
+    /**
+     * @dev Converts a uint256 to its ASCII string decimal representation.
+     */
+    function _toString(
+        uint256 value
+    ) internal pure virtual returns (string memory str) {
+        assembly {
+            // The maximum value of a uint256 contains 78 digits (1 byte per digit), but
+            // we allocate 0xa0 bytes to keep the free memory pointer 32-byte word aligned.
+            // We will need 1 word for the trailing zeros padding, 1 word for the length,
+            // and 3 words for a maximum of 78 digits. Total: 5 * 0x20 = 0xa0.
+            let m := add(mload(0x40), 0xa0)
+            // Update the free memory pointer to allocate.
+            mstore(0x40, m)
+            // Assign the `str` to the end.
+            str := sub(m, 0x20)
+            // Zeroize the slot after the string.
+            mstore(str, 0)
+
+            // Cache the end of the memory to calculate the length later.
+            let end := str
+
+            // We write the string from rightmost digit to leftmost digit.
+            // The following is essentially a do-while loop that also handles the zero case.
+            // prettier-ignore
+            for { let temp := value } 1 {} {
+                str := sub(str, 1)
+                // Write the character to the pointer.
+                // The ASCII index of the '0' character is 48.
+                mstore8(str, add(48, mod(temp, 10)))
+                // Keep dividing `temp` until zero.
+                temp := div(temp, 10)
+                // prettier-ignore
+                if iszero(temp) { break }
+            }
+
+            let length := sub(end, str)
+            // Move the pointer 32 bytes leftwards to make room for the length.
+            str := sub(str, 0x20)
+            // Store the length.
+            mstore(str, length)
+        }
+    }
+}

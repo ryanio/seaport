@@ -1,0 +1,1677 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+// import { ISeaDrop } from "../interfaces/ISeaDrop.sol";
+
+import {
+    AllowListData,
+    CreatorPayout,
+    MintParams,
+    PublicDrop,
+    SignedMintValidationMinMintPrice,
+    SignedMintValidationParams,
+    TokenGatedDropStage,
+    TokenGatedMintParams
+} from "../lib/SeaDropStructs.sol";
+
+import {
+    ContractOffererInterface
+} from "../../../interfaces/ContractOffererInterface.sol";
+
+import { ItemType } from "../../../lib/ConsiderationEnums.sol";
+
+import {
+    ReceivedItem,
+    Schema,
+    SpentItem
+} from "../../../lib/ConsiderationStructs.sol";
+
+import { IDelegationRegistry } from "../interfaces/IDelegationRegistry.sol";
+
+import { ReentrancyGuard } from "solmate/utils/ReentrancyGuard.sol";
+
+import { IERC721 } from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+
+import {
+    IERC165
+} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+
+import {
+    MerkleProof
+} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+
+import {
+    IERC165
+} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+
+/**
+ * @title  SeaDrop
+ * @author James Wenzel (emo.eth)
+ * @author Ryan Ghods (ralxz.eth)
+ * @author Stephan Min (stephanm.eth)
+ * @notice A Seaport contract offerer that mints NFTs for primary sales.
+ */
+contract SeaDrop is ContractOffererInterface, ReentrancyGuard {
+    using ECDSA for bytes32;
+
+    /// @notice The Seaport address that can call this contract.
+    address private immutable _SEAPORT;
+
+    /// @notice The conduit address that can call this contract.
+    address private immutable _CONDUIT;
+
+    /// @notice The delegation registry.
+    IDelegationRegistry public constant delegationRegistry =
+        IDelegationRegistry(0x00000000000076A84feF008CDAbe6409d2FE638B);
+
+    /// @notice The public drop data.
+    PublicDrop private _publicDrop;
+
+    /// @notice The creator payout addresses and basis points.
+    CreatorPayout[] private _creatorPayouts;
+
+    /// @notice The allow list merkle root.
+    bytes32 private _allowListMerkleRoot;
+
+    /// @notice The allowed fee recipients.
+    mapping(address => bool) private _allowedFeeRecipients;
+
+    /// @notice The enumerated allowed fee recipients.
+    address[] private _enumeratedFeeRecipients;
+
+    /// @notice The parameters for allowed signers for server-side drops.
+    mapping(address => SignedMintValidationParams)
+        private _signedMintValidationParams;
+
+    /// @notice The signers for each server-side drop.
+    address[] private _enumeratedSigners;
+
+    /// @notice The used signature digests.
+    mapping(bytes32 => bool) private _usedDigests;
+
+    /// @notice The allowed payers.
+    mapping(address => bool) private _allowedPayers;
+
+    /// @notice The enumerated allowed payers.
+    address[] private _enumeratedPayers;
+
+    /// @notice The token gated drop stages.
+    mapping(address => TokenGatedDropStage) private _tokenGatedDrops;
+
+    /// @notice The tokens for token gated drops.
+    address[] private _enumeratedTokenGatedTokens;
+
+    /// @notice The token IDs and redeemed counts for token gated drop stages.
+    mapping(address => mapping(uint256 => uint256)) private _tokenGatedRedeemed;
+
+    /// @notice Internal constants for EIP-712: Typed structured
+    ///         data hashing and signing
+    bytes32 internal constant _SIGNED_MINT_TYPEHASH =
+        // prettier-ignore
+        keccak256(
+            "SignedMint("
+                "address minter,"
+                "address feeRecipient,"
+                "MintParams mintParams,"
+                "uint256 salt"
+            ")"
+            "MintParams("
+                "uint256 mintPrice,"
+                "address paymentToken,"
+                "uint256 maxTotalMintableByWallet,"
+                "uint256 startTime,"
+                "uint256 endTime,"
+                "uint256 dropStageIndex,"
+                "uint256 maxTokenSupplyForStage,"
+                "uint256 feeBps,"
+                "bool restrictFeeRecipients"
+            ")"
+        );
+    bytes32 internal constant _MINT_PARAMS_TYPEHASH =
+        // prettier-ignore
+        keccak256(
+            "MintParams("
+                "uint256 mintPrice,"
+                "address paymentToken,"
+                "uint256 maxTotalMintableByWallet,"
+                "uint256 startTime,"
+                "uint256 endTime,"
+                "uint256 dropStageIndex,"
+                "uint256 maxTokenSupplyForStage,"
+                "uint256 feeBps,"
+                "bool restrictFeeRecipients"
+            ")"
+        );
+    bytes32 internal constant _EIP_712_DOMAIN_TYPEHASH =
+        // prettier-ignore
+        keccak256(
+            "EIP712Domain("
+                "string name,"
+                "string version,"
+                "uint256 chainId,"
+                "address verifyingContract"
+            ")"
+        );
+    bytes32 internal constant _NAME_HASH = keccak256("SeaDrop");
+    bytes32 internal constant _VERSION_HASH = keccak256("2.0");
+    uint256 internal immutable _CHAIN_ID = block.chainid;
+    bytes32 internal immutable _DOMAIN_SEPARATOR;
+
+    /// @notice Constant for an unlimited `maxTokenSupplyForStage`.
+    ///         Used in `mintPublic` where no `maxTokenSupplyForStage`
+    ///         is stored in the `PublicDrop` struct.
+    uint256 internal constant _UNLIMITED_MAX_TOKEN_SUPPLY_FOR_STAGE =
+        type(uint256).max;
+
+    /// @notice Constant for a public mint's `dropStageIndex`.
+    ///         Used in `mintPublic` where no `dropStageIndex`
+    ///         is stored in the `PublicDrop` struct.
+    uint256 internal constant _PUBLIC_DROP_STAGE_INDEX = 0;
+
+    /**
+     * @notice Constructor for the contract deployment.
+     *
+     * @param seaport The Seaport allowed to interact with this contract.
+     * @param conduit The conduit allowed to interact with this contract.
+     */
+    constructor(address seaport, address conduit) {
+        // Set the Seaport allowed to interact with this contract.
+        _SEAPORT = seaport;
+
+        // Set the conduit allowed to interact with this contract.
+        _CONDUIT = conduit;
+
+        // Set the domain separator.
+        _DOMAIN_SEPARATOR = _deriveDomainSeparator();
+    }
+
+    error InvalidCaller(address caller);
+    error UnsupportedExtraDataVersion(uint8 version);
+    error InvalidExtraDataEncoding(uint8 version);
+    error InvalidSubstandard(uint8 substandard);
+    error NotImplemented();
+
+    /**
+     * @dev Generates an order with the specified minimum and maximum spent
+     *      items, and optional context (supplied as extraData).
+     *
+     * @custom:param fulfiller       The address of the fulfiller.
+     * @param minimumReceived        The minimum items that the caller must
+     *                               receive. To specify a range of ERC-721
+     *                               tokens, use a null address ERC-1155 with
+     *                               the amount as the quantity.
+     * @custom:param maximumSpent    Maximum items the caller is willing to
+     *                               spend. Must meet or exceed the requirement.
+     * @param context                Additional context of the order. Can contain
+     *                               the contract deploy details for contracts.
+     *
+     * @return offer         An array containing the offer items.
+     * @return consideration An array containing the consideration items.
+     */
+    function generateOrder(
+        address /* fulfiller */,
+        SpentItem[] calldata minimumReceived,
+        SpentItem[] calldata /* maximumSpent */,
+        bytes calldata context // encoded based on the schemaID
+    )
+        external
+        override
+        returns (SpentItem[] memory offer, ReceivedItem[] memory consideration)
+    {
+        // Derive the offer and consideration.
+        (offer, consideration) = _processOrder(
+            msg.sender,
+            minimumReceived,
+            context
+        );
+    }
+
+    /**
+     * @dev Ratifies an order with the specified offer, consideration, and
+     *      optional context (supplied as extraData).
+     *
+     * @param offer                The offer items. One item will be present in
+     *                             cases where a token has been minted.
+     * @custom:param consideration The consideration items.
+     * @param context              Additional context of the order.
+     * @custom:param orderHashes   The hashes to ratify.
+     * @custom:param contractNonce The nonce of the contract.
+     *
+     * @return The magic value required by Seaport.
+     */
+    function ratifyOrder(
+        SpentItem[] calldata offer,
+        ReceivedItem[] calldata /* consideration */,
+        bytes calldata context, // encoded based on the schemaID
+        bytes32[] calldata /* orderHashes */,
+        uint256 /* contractNonce */
+    ) external override returns (bytes4) {
+        // Ensure that Seaport or the conduit is the caller.
+        if (msg.sender != _SEAPORT && msg.sender != _CONDUIT) {
+            revert InvalidCaller(msg.sender);
+        }
+
+        // Utilize assembly to efficiently return the ratifyOrder magic value.
+        assembly {
+            mstore(0, 0xf4dd92ce)
+            return(0x1c, 0x04)
+        }
+    }
+
+    /**
+     * @dev View function to preview an order generated in response to a minimum
+     *      set of received items, maximum set of spent items, and context
+     *      (supplied as extraData).
+     *
+     * @param caller              The address of the caller (e.g. Seaport).
+     * @custom:param fulfiller    The address of the fulfiller.
+     * @param minimumReceived     The minimum items that the caller must
+     *                            receive. If empty, the fulfiller receives the
+     *                            ability to transfer the NFT in question for a
+     *                            secondary fee; if a single item is provided
+     *                            and that item is an unminted NFT, the
+     *                            fulfiller receives the ability to transfer
+     *                            the NFT in question for a primary fee.
+     * @custom:param maximumSpent Maximum items the caller is willing to spend.
+     *                            Must meet or exceed the requirement.
+     * @param context             Additional context of the order, comprised of
+     *                            the NFT tokenID with transfer activation
+     *                            (32 bytes) including the 0x00 version byte.
+     *                            Unminted tokens do not need to supply any
+     *                            context as the minimumReceived item holds all
+     *                            necessary information.
+     *
+     * @return offer         An array containing the offer items.
+     * @return consideration An array containing the consideration items.
+     */
+    function previewOrder(
+        address caller,
+        address,
+        SpentItem[] calldata minimumReceived,
+        SpentItem[] calldata,
+        bytes calldata context
+    )
+        external
+        view
+        override
+        returns (SpentItem[] memory offer, ReceivedItem[] memory consideration)
+    {
+        // Derive the offer and consideration.
+        (offer, consideration) = _processOrder(
+            caller,
+            minimumReceived,
+            context
+        );
+    }
+
+    /**
+     * @dev Gets the metadata for this contract offerer.
+     *
+     * @return name    The name of the contract offerer.
+     * @return schemas The schemas supported by the contract offerer.
+     */
+    function getSeaportMetadata()
+        external
+        pure
+        override
+        returns (
+            string memory name,
+            Schema[] memory schemas // map to Seaport Improvement Proposal IDs
+        )
+    {
+        schemas = new Schema[](1);
+
+        schemas[0].id = 12;
+
+        // Encode the SIP-12 information.
+        uint256[] memory substandards = new uint256[](2);
+        substandards[0] = 0;
+        substandards[1] = 1;
+        schemas[0].metadata = abi.encode(substandards, "No documentation");
+
+        return ("SeaDrop", schemas);
+    }
+
+    /**
+     * @dev Generates an order with the specified enforced consideration items.
+     *
+     * @param caller                 The address of the caller; must be Seaport.
+     * @param minimumReceived        The minimum items that the caller must
+     *                               receive.
+     * @param context                Additional context of the order, comprised
+     *                               of the NFT tokenID with transfer activation
+     *                               (32 bytes) including the 0x00 version byte.
+     *                               Unminted tokens do not need to supply any
+     *                               context as the minimumReceived item holds
+     *                               all necessary information.
+     *
+     * @return               An array containing the offer items.
+     * @return consideration An array containing the consideration items.
+     */
+    function _processOrder(
+        address caller,
+        SpentItem[] calldata minimumReceived,
+        bytes calldata context
+    )
+        internal
+        view
+        returns (SpentItem[] memory, ReceivedItem[] memory consideration)
+    {
+        // Declare an error buffer; first check is that caller is Seaport.
+        uint256 errorBuffer = _cast(caller == _SEAPORT);
+
+        // Declare array for returned consideration containing the minted items.
+        consideration = new ReceivedItem[](1);
+
+        // Handle cases where a new, unminted NFT is being requested.
+        if (
+            errorBuffer != 0 &&
+            minimumReceived.length == 1 &&
+            minimumReceived[0].itemType == ItemType.ERC721 &&
+            minimumReceived[0].token == address(this)
+        ) {
+            SpentItem calldata item = minimumReceived[0];
+            // Ensure the item is spending this NFT; otherwise, tokens that are
+            // held by this contract that Seaport has approval to transfer can
+            // be taken.
+            if (
+                item.itemType == ItemType.ERC721 && item.token == address(this)
+            ) {
+                // Populate the enforced creator earnings as the consideration.
+                return (minimumReceived, consideration);
+            }
+        }
+
+        // Get the length of the context array from calldata (masked).
+        uint256 contextLength;
+        assembly {
+            contextLength := and(calldataload(context.offset), 0xfffffff)
+        }
+
+        {
+            // Next, check for sip-6 version byte.
+            errorBuffer |= errorBuffer ^ (_cast(context[0] == 0x00) << 1);
+
+            // Next, check for supported substandard.
+            errorBuffer |= errorBuffer ^ (_cast(context[1] == 0x01) << 2);
+
+            // Next, check for correct context length.
+            unchecked {
+                errorBuffer |= errorBuffer ^ (_cast(contextLength == 34) << 3);
+            }
+
+            // Handle decoding errors.
+            if (errorBuffer != 0) {
+                uint8 version = uint8(context[0]);
+
+                if (errorBuffer << 255 != 0) {
+                    revert InvalidCaller(msg.sender);
+                } else if (errorBuffer << 254 != 0) {
+                    revert UnsupportedExtraDataVersion(version);
+                } else if (errorBuffer << 253 != 0) {
+                    revert InvalidSubstandard(uint8(context[1]));
+                } else if (errorBuffer << 252 != 0) {
+                    revert InvalidExtraDataEncoding(version);
+                }
+            }
+        }
+
+        return (new SpentItem[](0), consideration);
+    }
+
+    /**
+     * @notice Mint a public drop.
+     *
+     * @param feeRecipient     The fee recipient.
+     * @param minterIfNotPayer The mint recipient if different than the payer.
+     * @param quantity         The number of tokens to mint.
+     */
+    function _mintPublic(
+        address feeRecipient,
+        address minterIfNotPayer,
+        uint256 quantity
+    ) internal override {
+        // Get the public drop data.
+        PublicDrop memory publicDrop = _publicDrop;
+
+        // Ensure that the drop has started.
+        _checkActive(publicDrop.startTime, publicDrop.endTime);
+
+        // Put the mint price on the stack.
+        uint256 mintPrice = publicDrop.mintPrice;
+
+        // Get the minter address.
+        address minter = minterIfNotPayer != address(0)
+            ? minterIfNotPayer
+            : msg.sender;
+
+        // Ensure the payer is allowed if not the minter.
+        if (minter != msg.sender) {
+            if (
+                !_allowedPayers[msg.sender] &&
+                !delegationRegistry.checkDelegateForAll(msg.sender, minter)
+            ) {
+                revert PayerNotAllowed();
+            }
+        }
+
+        // Check that the minter is allowed to mint the desired quantity.
+        _checkMintQuantity(
+            minter,
+            quantity,
+            publicDrop.maxTotalMintableByWallet,
+            _UNLIMITED_MAX_TOKEN_SUPPLY_FOR_STAGE
+        );
+
+        // Check that the fee recipient is allowed if restricted.
+        _checkFeeRecipientIsAllowed(
+            feeRecipient,
+            publicDrop.restrictFeeRecipients
+        );
+
+        // Mint the token(s), split the payout, emit an event.
+        _mintAndEmit(
+            minter,
+            quantity,
+            mintPrice,
+            publicDrop.paymentToken,
+            _PUBLIC_DROP_STAGE_INDEX,
+            publicDrop.feeBps,
+            feeRecipient
+        );
+    }
+
+    /**
+     * @notice Mint from an allow list.
+     *
+     * @param feeRecipient     The fee recipient.
+     * @param minterIfNotPayer The mint recipient if different than the payer.
+     * @param quantity         The number of tokens to mint.
+     * @param mintParams       The mint parameters.
+     * @param proof            The proof for the leaf of the allow list.
+     */
+    function _mintAllowList(
+        address feeRecipient,
+        address minterIfNotPayer,
+        uint256 quantity,
+        MintParams calldata mintParams,
+        bytes32[] calldata proof
+    ) internal override {
+        // Check that the drop stage is active.
+        _checkActive(mintParams.startTime, mintParams.endTime);
+
+        // Put the mint price on the stack.
+        uint256 mintPrice = mintParams.mintPrice;
+
+        // Get the minter address.
+        address minter = minterIfNotPayer != address(0)
+            ? minterIfNotPayer
+            : msg.sender;
+
+        // Ensure the payer is allowed if not the minter.
+        if (minter != msg.sender) {
+            if (
+                !_allowedPayers[msg.sender] &&
+                !delegationRegistry.checkDelegateForAll(msg.sender, minter)
+            ) {
+                revert PayerNotAllowed();
+            }
+        }
+
+        // Check that the minter is allowed to mint the desired quantity.
+        _checkMintQuantity(
+            minter,
+            quantity,
+            mintParams.maxTotalMintableByWallet,
+            mintParams.maxTokenSupplyForStage
+        );
+
+        // Check that the fee recipient is allowed if restricted.
+        _checkFeeRecipientIsAllowed(
+            feeRecipient,
+            mintParams.restrictFeeRecipients
+        );
+
+        // Verify the proof.
+        if (
+            !MerkleProof.verify(
+                proof,
+                _allowListMerkleRoot,
+                keccak256(abi.encode(minter, mintParams))
+            )
+        ) {
+            revert InvalidProof();
+        }
+
+        // Mint the token(s), split the payout, emit an event.
+        _mintAndEmit(
+            minter,
+            quantity,
+            mintPrice,
+            mintParams.paymentToken,
+            mintParams.dropStageIndex,
+            mintParams.feeBps,
+            feeRecipient
+        );
+    }
+
+    /**
+     * @notice Mint with a server-side signature.
+     *         Note that a signature can only be used once.
+     *
+     * @param feeRecipient     The fee recipient.
+     * @param minterIfNotPayer The mint recipient if different than the payer.
+     * @param quantity         The number of tokens to mint.
+     * @param mintParams       The mint parameters.
+     * @param salt             The salt for the signed mint.
+     * @param signature        The server-side signature, must be an allowed
+     *                         signer.
+     */
+    function _mintSigned(
+        address feeRecipient,
+        address minterIfNotPayer,
+        uint256 quantity,
+        MintParams calldata mintParams,
+        uint256 salt,
+        bytes calldata signature
+    ) internal override {
+        // Check that the drop stage is active.
+        _checkActive(mintParams.startTime, mintParams.endTime);
+
+        // Get the minter address.
+        address minter = minterIfNotPayer != address(0)
+            ? minterIfNotPayer
+            : msg.sender;
+
+        // Ensure the payer is allowed if not the minter.
+        if (minter != msg.sender) {
+            if (
+                !_allowedPayers[msg.sender] &&
+                !delegationRegistry.checkDelegateForAll(msg.sender, minter)
+            ) {
+                revert PayerNotAllowed();
+            }
+        }
+
+        // Check that the minter is allowed to mint the desired quantity.
+        _checkMintQuantity(
+            minter,
+            quantity,
+            mintParams.maxTotalMintableByWallet,
+            mintParams.maxTokenSupplyForStage
+        );
+
+        // Check that the fee recipient is allowed if restricted.
+        _checkFeeRecipientIsAllowed(
+            feeRecipient,
+            mintParams.restrictFeeRecipients
+        );
+
+        // Validate the signature in a block scope to avoid "stack too deep".
+        {
+            // Get the digest to verify the EIP-712 signature.
+            bytes32 digest = _getDigest(minter, feeRecipient, mintParams, salt);
+
+            // Ensure the digest has not already been used.
+            if (_usedDigests[digest]) {
+                revert SignatureAlreadyUsed();
+            }
+
+            // Mark the digest as used.
+            _usedDigests[digest] = true;
+
+            // Use the recover method to see what address was used to create
+            // the signature on this data.
+            // Note that if the digest doesn't exactly match what was signed we'll
+            // get a random recovered address.
+            address recoveredAddress = digest.recover(signature);
+            _validateSignerAndParams(mintParams, recoveredAddress);
+        }
+
+        // Mint the token(s), split the payout, emit an event.
+        _mintAndEmit(
+            minter,
+            quantity,
+            mintParams.mintPrice,
+            mintParams.paymentToken,
+            mintParams.dropStageIndex,
+            mintParams.feeBps,
+            feeRecipient
+        );
+    }
+
+    /**
+     * @notice Enforce stored parameters for signed mints to mitigate
+     *         the effects of a malicious signer.
+     */
+    function _validateSignerAndParams(
+        MintParams memory mintParams,
+        address signer
+    ) internal view {
+        SignedMintValidationParams
+            memory signedMintValidationParams = _signedMintValidationParams[
+                signer
+            ];
+
+        // Check that SignedMintValidationParams have been initialized; if not,
+        // this is an invalid signer.
+        if (signedMintValidationParams.maxMaxTotalMintableByWallet == 0) {
+            revert InvalidSignature(signer);
+        }
+
+        // Validate individual params.
+        if (mintParams.mintPrice < signedMintValidationParams.minMintPrice) {
+            revert InvalidSignedMintPrice(
+                mintParams.mintPrice,
+                signedMintValidationParams.minMintPrice
+            );
+        }
+        uint256 minMintPrice;
+        uint256 validationMintPriceLength = signedMintValidationParams
+            .minMintPrices
+            .length;
+        for (uint256 i = 0; i < validationMintPriceLength; ) {
+            if (
+                mintParams.paymentToken ==
+                signedMintValidationParams.minMintPrices[i].paymentToken
+            ) {
+                minMintPrice = signedMintValidationParams
+                    .minMintPrices[i]
+                    .minMintPrice;
+                break;
+            }
+            unchecked {
+                ++i;
+            }
+        }
+        if (mintParams.mintPrice < minMintPrice) {
+            revert InvalidSignedMintPrice(
+                mintParams.paymentToken,
+                mintParams.mintPrice,
+                minMintPrice
+            );
+        }
+        if (
+            mintParams.paymentToken != signedMintValidationParams.paymentTokens
+        ) {
+            revert InvalidSignedMintPrice(
+                mintParams.paymentToken,
+                mintParams.mintPrice,
+                signedMintValidationParams.minMintPrice
+            );
+        }
+        if (
+            mintParams.maxTotalMintableByWallet >
+            signedMintValidationParams.maxMaxTotalMintableByWallet
+        ) {
+            revert InvalidSignedMaxTotalMintableByWallet(
+                mintParams.maxTotalMintableByWallet,
+                signedMintValidationParams.maxMaxTotalMintableByWallet
+            );
+        }
+        if (mintParams.startTime < signedMintValidationParams.minStartTime) {
+            revert InvalidSignedStartTime(
+                mintParams.startTime,
+                signedMintValidationParams.minStartTime
+            );
+        }
+        if (mintParams.endTime > signedMintValidationParams.maxEndTime) {
+            revert InvalidSignedEndTime(
+                mintParams.endTime,
+                signedMintValidationParams.maxEndTime
+            );
+        }
+        if (
+            mintParams.maxTokenSupplyForStage >
+            signedMintValidationParams.maxMaxTokenSupplyForStage
+        ) {
+            revert InvalidSignedMaxTokenSupplyForStage(
+                mintParams.maxTokenSupplyForStage,
+                signedMintValidationParams.maxMaxTokenSupplyForStage
+            );
+        }
+        if (mintParams.feeBps > signedMintValidationParams.maxFeeBps) {
+            revert InvalidSignedFeeBps(
+                mintParams.feeBps,
+                signedMintValidationParams.maxFeeBps
+            );
+        }
+        if (mintParams.feeBps < signedMintValidationParams.minFeeBps) {
+            revert InvalidSignedFeeBps(
+                mintParams.feeBps,
+                signedMintValidationParams.minFeeBps
+            );
+        }
+        if (!mintParams.restrictFeeRecipients) {
+            revert SignedMintsMustRestrictFeeRecipients();
+        }
+    }
+
+    /**
+     * @notice Mint as an allowed token holder.
+     *         This will mark the token ids as redeemed and will revert if the
+     *         same token id is attempted to be redeemed twice.
+     *
+     * @param feeRecipient     The fee recipient.
+     * @param minterIfNotPayer The mint recipient if different than the payer.
+     * @param mintParams       The token gated mint params.
+     */
+    function _mintAllowedTokenHolder(
+        address feeRecipient,
+        address minterIfNotPayer,
+        TokenGatedMintParams calldata mintParams
+    ) internal override {
+        // Get the minter address.
+        address minter = minterIfNotPayer != address(0)
+            ? minterIfNotPayer
+            : msg.sender;
+
+        // Ensure the payer is allowed if not the minter.
+        if (minter != msg.sender) {
+            if (
+                !_allowedPayers[msg.sender] &&
+                !delegationRegistry.checkDelegateForAll(msg.sender, minter)
+            ) {
+                revert PayerNotAllowed();
+            }
+        }
+
+        // Put the allowedNftToken on the stack for more efficient access.
+        address allowedNftToken = mintParams.allowedNftToken;
+
+        // Set the dropStage to a variable.
+        TokenGatedDropStage memory dropStage = _tokenGatedDrops[
+            allowedNftToken
+        ];
+
+        // Validate that the dropStage is active.
+        _checkActive(dropStage.startTime, dropStage.endTime);
+
+        // Check that the fee recipient is allowed if restricted.
+        _checkFeeRecipientIsAllowed(
+            feeRecipient,
+            dropStage.restrictFeeRecipients
+        );
+
+        // Put the mint quantity on the stack for more efficient access.
+        uint256 mintQuantity = mintParams.allowedNftTokenIds.length;
+
+        // Check that the minter is allowed to mint the desired quantity.
+        _checkMintQuantity(
+            minter,
+            mintQuantity,
+            dropStage.maxTotalMintableByWallet,
+            dropStage.maxTokenSupplyForStage
+        );
+
+        // Iterate through each allowedNftTokenId
+        // to ensure it is not already fully redeemed.
+        for (uint256 i = 0; i < mintQuantity; ) {
+            // Put the tokenId on the stack.
+            uint256 tokenId = mintParams.allowedNftTokenIds[i];
+
+            // Check that the minter is the owner of the allowedNftTokenId.
+            if (IERC721(allowedNftToken).ownerOf(tokenId) != minter) {
+                revert TokenGatedNotTokenOwner(allowedNftToken, tokenId);
+            }
+
+            // Cache the storage pointer for cheaper access.
+            mapping(uint256 => uint256)
+                storage redeemedTokenIds = _tokenGatedRedeemed[allowedNftToken];
+
+            // Check that the token id has not already been redeemed to its limit.
+            if (
+                redeemedTokenIds[tokenId] >
+                dropStage.maxMintablePerRedeemedToken
+            ) {
+                revert TokenGatedTokenIdAlreadyFullyRedeemed(
+                    allowedNftToken,
+                    tokenId,
+                    dropStage.maxMintablePerRedeemedToken
+                );
+            }
+
+            // Increase mint count on redeemed token id.
+            redeemedTokenIds[tokenId] += 1;
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        // Mint the token(s), split the payout, emit an event.
+        _mintAndEmit(
+            minter,
+            mintQuantity,
+            dropStage.mintPrice,
+            dropStage.paymentToken,
+            dropStage.dropStageIndex,
+            dropStage.feeBps,
+            feeRecipient
+        );
+    }
+
+    /**
+     * @notice Check that the drop stage is active.
+     *
+     * @param startTime The drop stage start time.
+     * @param endTime   The drop stage end time.
+     */
+    function _checkActive(uint256 startTime, uint256 endTime) internal view {
+        if (
+            _cast(block.timestamp < startTime) |
+                _cast(block.timestamp > endTime) ==
+            1
+        ) {
+            // Revert if the drop stage is not active.
+            revert NotActive(block.timestamp, startTime, endTime);
+        }
+    }
+
+    /**
+     * @notice Check that the fee recipient is allowed.
+     *
+     * @param feeRecipient          The fee recipient.
+     * @param restrictFeeRecipients If the fee recipients are restricted.
+     */
+    function _checkFeeRecipientIsAllowed(
+        address feeRecipient,
+        bool restrictFeeRecipients
+    ) internal view {
+        // Ensure the fee recipient is not the zero address.
+        if (feeRecipient == address(0)) {
+            revert FeeRecipientCannotBeZeroAddress();
+        }
+
+        // Revert if the fee recipient is restricted and not allowed.
+        if (restrictFeeRecipients)
+            if (!_allowedFeeRecipients[feeRecipient]) {
+                revert FeeRecipientNotAllowed();
+            }
+    }
+
+    /**
+     * @notice Check that the wallet is allowed to mint the desired quantity.
+     *
+     * @param minter                   The mint recipient.
+     * @param quantity                 The number of tokens to mint.
+     * @param maxTotalMintableByWallet The max allowed mints per wallet.
+     * @param maxTokenSupplyForStage   The max token supply for the drop stage.
+     */
+    function _checkMintQuantity(
+        address minter,
+        uint256 quantity,
+        uint256 maxTotalMintableByWallet,
+        uint256 maxTokenSupplyForStage
+    ) internal view {
+        // Mint quantity of zero is not valid.
+        if (quantity == 0) {
+            revert MintQuantityCannotBeZero();
+        }
+
+        // Get the mint stats.
+        (
+            uint256 minterNumMinted,
+            uint256 currentTotalSupply,
+            uint256 maxSupply
+        ) = getMintStats(minter);
+
+        // Ensure mint quantity doesn't exceed maxTotalMintableByWallet.
+        if (quantity + minterNumMinted > maxTotalMintableByWallet) {
+            revert MintQuantityExceedsMaxMintedPerWallet(
+                quantity + minterNumMinted,
+                maxTotalMintableByWallet
+            );
+        }
+
+        // Ensure mint quantity doesn't exceed maxSupply.
+        if (quantity + currentTotalSupply > maxSupply) {
+            revert MintQuantityExceedsMaxSupply(
+                quantity + currentTotalSupply,
+                maxSupply
+            );
+        }
+
+        // Ensure mint quantity doesn't exceed maxTokenSupplyForStage.
+        if (quantity + currentTotalSupply > maxTokenSupplyForStage) {
+            revert MintQuantityExceedsMaxTokenSupplyForStage(
+                quantity + currentTotalSupply,
+                maxTokenSupplyForStage
+            );
+        }
+    }
+
+    /**
+     * @notice Derive the required consideration items for the mint,
+     *         includes the fee recipient and creator payouts.
+     *
+     * @param quantity     The number of tokens to mint.
+     * @param mintPrice    The mint price per token.
+     * @param paymentToken The payment token.
+     * @param feeRecipient The fee recipient.
+     * @param feeBps       The fee basis points.
+     */
+    function _requiredItems(
+        uint256 quantity,
+        uint256 mintPrice,
+        address paymentToken,
+        address feeRecipient,
+        uint256 feeBps
+    ) internal returns (ReceivedItem[] memory receivedItems) {
+        // If the mint price is zero, return early as there
+        // are no required consideration items.
+        if (mintPrice == 0) return;
+
+        // Revert if the fee basis points are greater than 10_000.
+        if (feeBps > 10_000) {
+            revert InvalidFeeBps(feeBps);
+        }
+
+        // Set the itemType.
+        ItemType itemType = paymentToken == address(0)
+            ? ItemType.NATIVE
+            : ItemType.ERC20;
+
+        // Put the total mint price on the stack.
+        uint256 totalMintPrice = quantity * mintPrice;
+
+        // Get the fee amount.
+        // Note that the fee amount is rounded down in favor of the creator.
+        uint256 feeAmount = (totalMintPrice * feeBps) / 10_000;
+
+        // Get the creator payout amount.
+        // Fee amount is <= totalMintPrice per above.
+        uint256 payoutAmount;
+        unchecked {
+            payoutAmount = totalMintPrice - feeAmount;
+        }
+
+        // Add a consideration item for the fee recipient.
+        if (feeAmount > 0) {
+            receivedItems.push(
+                ReceivedItem({
+                    itemType: itemType,
+                    token: paymentToken,
+                    identifier: uint256(0),
+                    amount: feeAmount,
+                    recipient: feeRecipient
+                })
+            );
+        }
+
+        // Get the creator payouts.
+        address creatorPayouts = _creatorPayouts;
+
+        // Put the length of total creator payouts on the stack.
+        uint256 creatorPayoutsLength = creatorPayouts.length;
+
+        // Add a consideration item for each creator payout.
+        for (uint256 i = 0; i < creatorPayoutsLength; ) {
+            // Put the creator payout on the stack.
+            CreatorPayout memory creatorPayout = creatorPayouts[i];
+
+            // Ensure the creator payout address is not the zero address.
+            if (creatorPayout.payoutAddress == address(0)) {
+                revert CreatorPayoutAddressCannotBeZeroAddress();
+            }
+
+            // Get the creator payout amount.
+            // Note that the payout amount is rounded down.
+            uint256 creatorPayoutAmount = (payoutAmount *
+                creatorPayout.basisPoints) / 10_000;
+
+            receivedItems.push(
+                ReceivedItem({
+                    itemType: itemType,
+                    token: paymentToken,
+                    identifier: uint256(0),
+                    amount: creatorPayoutAmount,
+                    recipient: creatorPayout.payoutAddress
+                })
+            );
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Mints a number of tokens and emits an event.
+     *
+     * @param minter         The mint recipient.
+     * @param payer          The address that payed for the mint.
+     * @param quantity       The number of tokens to mint.
+     * @param mintPrice      The mint price per token.
+     * @param paymentToken   The payment token. Null for native token.
+     * @param dropStageIndex The drop stage index.
+     * @param feeBps         The fee basis points.
+     * @param feeRecipient   The fee recipient.
+     */
+    function _mintAndEmit(
+        address minter,
+        address payer,
+        uint256 quantity,
+        uint256 mintPrice,
+        address paymentToken,
+        uint256 dropStageIndex,
+        uint256 feeBps,
+        address feeRecipient
+    ) internal nonReentrant {
+        // Extra safety check to ensure the max supply is not exceeded.
+        if (_totalMinted() + quantity > maxSupply()) {
+            revert MintQuantityExceedsMaxSupply(
+                _totalMinted() + quantity,
+                maxSupply()
+            );
+        }
+
+        // Mint the token(s).
+        _mint(minter, quantity);
+
+        // Emit an event for the mint.
+        emit SeaDropMint(
+            minter,
+            payer,
+            feeRecipient,
+            msg.sender,
+            quantity,
+            mintPrice,
+            paymentToken,
+            feeBps,
+            dropStageIndex
+        );
+    }
+
+    /**
+     * @dev Internal view function to get the EIP-712 domain separator. If the
+     *      chainId matches the chainId set on deployment, the cached domain
+     *      separator will be returned; otherwise, it will be derived from
+     *      scratch.
+     *
+     * @return The domain separator.
+     */
+    function _domainSeparator() internal view returns (bytes32) {
+        // prettier-ignore
+        return block.chainid == _CHAIN_ID
+            ? _DOMAIN_SEPARATOR
+            : _deriveDomainSeparator();
+    }
+
+    /**
+     * @dev Internal view function to derive the EIP-712 domain separator.
+     *
+     * @return The derived domain separator.
+     */
+    function _deriveDomainSeparator() internal view returns (bytes32) {
+        // prettier-ignore
+        return keccak256(
+            abi.encode(
+                _EIP_712_DOMAIN_TYPEHASH,
+                _NAME_HASH,
+                _VERSION_HASH,
+                block.chainid,
+                address(this)
+            )
+        );
+    }
+
+    /**
+     * @notice Returns the mint public drop data.
+     */
+    function getPublicDrop() external view returns (PublicDrop memory) {
+        return _publicDrop;
+    }
+
+    /**
+     * @notice Returns the creator payouts for the nft contract.
+     */
+    function getCreatorPayouts()
+        external
+        view
+        returns (CreatorPayout[] memory)
+    {
+        return _creatorPayouts;
+    }
+
+    /**
+     * @notice Returns the allow list merkle root for the nft contract.
+     */
+    function getAllowListMerkleRoot() external view returns (bytes32) {
+        return _allowListMerkleRoot;
+    }
+
+    /**
+     * @notice Returns if the specified fee recipient is allowed
+     *         for the nft contract.
+     */
+    function getFeeRecipientIsAllowed(
+        address feeRecipient
+    ) external view returns (bool) {
+        return _allowedFeeRecipients[feeRecipient];
+    }
+
+    /**
+     * @notice Returns an enumeration of allowed fee recipients
+     *         when fee recipients are enforced.
+     */
+    function getAllowedFeeRecipients()
+        external
+        view
+        returns (address[] memory)
+    {
+        return _enumeratedFeeRecipients;
+    }
+
+    /**
+     * @notice Returns the server-side signers.
+     */
+    function getSigners() external view returns (address[] memory) {
+        return _enumeratedSigners;
+    }
+
+    /**
+     * @notice Returns the struct of SignedMintValidationParams for a signer.
+     *
+     * @param signer      The signer.
+     */
+    function getSignedMintValidationParams(
+        address signer
+    ) external view returns (SignedMintValidationParams memory) {
+        return _signedMintValidationParams[signer];
+    }
+
+    /**
+     * @notice Returns the allowed payers.
+     */
+    function getPayers() external view returns (address[] memory) {
+        return _enumeratedPayers;
+    }
+
+    /**
+     * @notice Returns if the specified payer is allowed.
+     *
+     * @param payer The payer.
+     */
+    function getPayerIsAllowed(address payer) external view returns (bool) {
+        return _allowedPayers[payer];
+    }
+
+    /**
+     * @notice Returns the allowed token gated drop tokens.
+     */
+    function getTokenGatedAllowedTokens()
+        external
+        view
+        returns (address[] memory)
+    {
+        return _enumeratedTokenGatedTokens;
+    }
+
+    /**
+     * @notice Returns the token gated drop data for the token gated nft.
+     */
+    function getTokenGatedDrop(
+        address allowedNftToken
+    ) external view returns (TokenGatedDropStage memory) {
+        return _tokenGatedDrops;
+    }
+
+    /**
+     * @notice Returns the redeemed count for a token id for a
+     *         token gated drop.
+     *
+     * @param allowedNftToken   The token gated nft token.
+     * @param allowedNftTokenId The token gated nft token id to check.
+     */
+    function getAllowedNftTokenIdRedeemedCount(
+        address allowedNftToken,
+        uint256 allowedNftTokenId
+    ) external view returns (uint256) {
+        return _tokenGatedRedeemed[allowedNftToken][allowedNftTokenId];
+    }
+
+    /**
+     * @notice Emits an event to notify update of the drop URI.
+     *
+     *         Only the owner can use this function.
+     *
+     * @param dropURI The new drop URI.
+     */
+    function updateDropURI(string calldata dropURI) external {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        // Emit an event with the update.
+        emit DropURIUpdated(dropURI);
+    }
+
+    /**
+     * @notice Updates the public drop data and emits an event.
+     *
+     *         Only the owner can use this function.
+     *
+     * @param publicDrop The public drop data.
+     */
+    function updatePublicDrop(
+        PublicDrop calldata publicDrop
+    ) external override {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        // Revert if the fee basis points is greater than 10_000.
+        if (publicDrop.feeBps > 10_000) {
+            revert InvalidFeeBps(publicDrop.feeBps);
+        }
+
+        // Set the public drop data.
+        _publicDrop = publicDrop;
+
+        // Emit an event with the update.
+        emit PublicDropUpdated(publicDrop);
+    }
+
+    /**
+     * @notice Updates the allow list merkle root for the nft contract
+     *         and emits an event.
+     *
+     *         Only the owner can use this function.
+     *
+     * @param allowListData The allow list data.
+     */
+    function updateAllowList(
+        AllowListData calldata allowListData
+    ) external override {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        // Track the previous root.
+        bytes32 prevRoot = _allowListMerkleRoot;
+
+        // Update the merkle root.
+        _allowListMerkleRoot = allowListData.merkleRoot;
+
+        // Emit an event with the update.
+        emit AllowListUpdated(
+            prevRoot,
+            allowListData.merkleRoot,
+            allowListData.publicKeyURIs,
+            allowListData.allowListURI
+        );
+    }
+
+    /**
+     * @notice Updates the token gated drop stage for the nft contract
+     *         and emits an event.
+     *
+     *         Only the owner can use this function.
+     *
+     *         Note: If two INonFungibleSeaDropToken tokens are doing
+     *         simultaneous token gated drop promotions for each other,
+     *         they can be minted by the same actor until
+     *         `maxTokenSupplyForStage` is reached. Please ensure the
+     *         `allowedNftToken` is not running an active drop during
+     *         the `dropStage` time period.
+     *
+     * @param allowedNftToken The token gated nft token.
+     * @param dropStage       The token gated drop stage data.
+     */
+    function updateTokenGatedDrop(
+        address allowedNftToken,
+        TokenGatedDropStage calldata dropStage
+    ) external override {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        // Ensure the allowedNftToken is not the zero address.
+        if (allowedNftToken == address(0)) {
+            revert TokenGatedDropAllowedNftTokenCannotBeZeroAddress();
+        }
+
+        // Ensure the allowedNftToken is not the drop token itself.
+        if (allowedNftToken == msg.sender) {
+            revert TokenGatedDropAllowedNftTokenCannotBeDropToken();
+        }
+
+        // Revert if the fee basis points are greater than 10_000.
+        if (dropStage.feeBps > 10_000) {
+            revert InvalidFeeBps(dropStage.feeBps);
+        }
+
+        // Use maxTotalMintableByWallet != 0 as a signal that this update should
+        // add or update the drop stage, otherwise we will be removing.
+        bool addOrUpdateDropStage = dropStage.maxTotalMintableByWallet != 0;
+
+        // Get pointers to the token gated drop data and enumerated addresses.
+        TokenGatedDropStage storage existingDropStageData = _tokenGatedDrops[
+            msg.sender
+        ][allowedNftToken];
+        address[] storage enumeratedTokens = _enumeratedTokenGatedTokens[
+            msg.sender
+        ];
+
+        // Stage struct packs to a single slot, so load it
+        // as a uint256; if it is 0, it is empty.
+        bool dropStageDoesNotExist;
+        assembly {
+            dropStageDoesNotExist := iszero(sload(existingDropStageData.slot))
+        }
+
+        if (addOrUpdateDropStage) {
+            _tokenGatedDrops[msg.sender][allowedNftToken] = dropStage;
+            // Add to enumeration if it does not exist already.
+            if (dropStageDoesNotExist) {
+                enumeratedTokens.push(allowedNftToken);
+            }
+        } else {
+            // Check we are not deleting a drop stage that does not exist.
+            if (dropStageDoesNotExist) {
+                revert TokenGatedDropStageNotPresent();
+            }
+            // Clear storage slot and remove from enumeration.
+            delete _tokenGatedDrops[msg.sender][allowedNftToken];
+            _removeFromEnumeration(allowedNftToken, enumeratedTokens);
+        }
+
+        // Emit an event with the update.
+        emit TokenGatedDropStageUpdated(allowedNftToken, dropStage);
+    }
+
+    /**
+     * @notice Updates the creator payouts and emits an event.
+     *         The basis points must add up to 10_000 exactly.
+     *
+     *         Only the owner can use this function.
+     *
+     * @param creatorPayouts The creator payout address and basis points.
+     */
+    function updateCreatorPayouts(
+        CreatorPayout[] calldata creatorPayouts
+    ) external {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        // Reset the creator payout array.
+        delete _creatorPayouts;
+
+        // Track the total bais points.
+        uint256 totalBasisPoints;
+
+        // Put the total creator payouts length on the stack.
+        uint256 creatorPayoutsLength = creatorPayouts.length;
+
+        for (uint256 i; i < creatorPayoutsLength; i++) {
+            // Get the creator payout.
+            CreatorPayout memory creatorPayout = creatorPayouts[i];
+
+            // Ensure the creator payout address is not the zero address.
+            if (creatorPayout.payoutAddress == address(0)) {
+                revert CreatorPayoutAddressCannotBeZeroAddress();
+            }
+
+            // Ensure the basis points are not zero.
+            if (creatorPayout.basisPoints == 0) {
+                revert CreatorPayoutBasisPointsCannotBeZero();
+            }
+
+            // Add to the total basis points.
+            totalBasisPoints += creatorPayout.basisPoints;
+
+            // Push to storage.
+            _creatorPayouts[msg.sender].push(creatorPayout);
+        }
+
+        // Ensure the total basis points equals 10_000 exactly.
+        if (totalBasisPoints != 10_000) {
+            revert InvalidCreatorPayoutTotalBasisPoints(totalBasisPoints);
+        }
+
+        // Emit an event with the update.
+        emit CreatorPayoutsUpdated(creatorPayouts);
+    }
+
+    /**
+     * @notice Updates the allowed fee recipient and emits an event.
+     *
+     *         Only the owner can use this function.
+     *
+     * @param feeRecipient The fee recipient.
+     * @param allowed      If the fee recipient is allowed.
+     */
+    function updateAllowedFeeRecipient(
+        address feeRecipient,
+        bool allowed
+    ) external {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        if (feeRecipient == address(0)) {
+            revert FeeRecipientCannotBeZeroAddress();
+        }
+
+        // Track the enumerated storage.
+        address[] storage enumeratedStorage = _enumeratedFeeRecipients[
+            msg.sender
+        ];
+        mapping(address => bool)
+            storage feeRecipientsMap = _allowedFeeRecipients[msg.sender];
+
+        if (allowed) {
+            if (feeRecipientsMap[feeRecipient]) {
+                revert DuplicateFeeRecipient();
+            }
+            feeRecipientsMap[feeRecipient] = true;
+            enumeratedStorage.push(feeRecipient);
+        } else {
+            if (!feeRecipientsMap[feeRecipient]) {
+                revert FeeRecipientNotPresent();
+            }
+            delete _allowedFeeRecipients[msg.sender][feeRecipient];
+            _removeFromEnumeration(feeRecipient, enumeratedStorage);
+        }
+
+        // Emit an event with the update.
+        emit AllowedFeeRecipientUpdated(msg.sender, feeRecipient, allowed);
+    }
+
+    /**
+     * @notice Updates the allowed server-side signers and emits an event.
+     *
+     *         Only the owner can use this function.
+     *
+     * @param signer                     The signer to update.
+     * @param signedMintValidationParams Minimum and maximum parameters
+     *                                   to enforce for signed mints.
+     */
+    function updateSignedMintValidationParams(
+        address signer,
+        SignedMintValidationParams calldata signedMintValidationParams
+    ) external {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        if (signer == address(0)) {
+            revert SignerCannotBeZeroAddress();
+        }
+
+        if (signedMintValidationParams.minFeeBps > 10_000) {
+            revert InvalidFeeBps(signedMintValidationParams.minFeeBps);
+        }
+        if (signedMintValidationParams.maxFeeBps > 10_000) {
+            revert InvalidFeeBps(signedMintValidationParams.maxFeeBps);
+        }
+
+        // Track the enumerated storage.
+        address[] storage enumeratedStorage = _enumeratedSigners[msg.sender];
+        mapping(address => SignedMintValidationParams)
+            storage signedMintValidationParamsMap = _signedMintValidationParams[
+                msg.sender
+            ];
+
+        SignedMintValidationParams
+            storage existingSignedMintValidationParams = signedMintValidationParamsMap[
+                signer
+            ];
+
+        bool signedMintValidationParamsDoNotExist;
+        assembly {
+            signedMintValidationParamsDoNotExist := iszero(
+                sload(existingSignedMintValidationParams.slot)
+            )
+        }
+        // Use maxMaxTotalMintableByWallet as sentry for add/update or delete.
+        bool addOrUpdate = signedMintValidationParams
+            .maxMaxTotalMintableByWallet > 0;
+
+        if (addOrUpdate) {
+            signedMintValidationParamsMap[signer] = signedMintValidationParams;
+            if (signedMintValidationParamsDoNotExist) {
+                enumeratedStorage.push(signer);
+            }
+        } else {
+            if (
+                existingSignedMintValidationParams
+                    .maxMaxTotalMintableByWallet == 0
+            ) {
+                revert SignerNotPresent();
+            }
+            delete _signedMintValidationParams[msg.sender][signer];
+            _removeFromEnumeration(signer, enumeratedStorage);
+        }
+
+        // Emit an event with the update.
+        emit SignedMintValidationParamsUpdated(
+            msg.sender,
+            signer,
+            signedMintValidationParams
+        );
+    }
+
+    /**
+     * @notice Updates the allowed payer and emits an event.
+     *
+     *         Only the owner can use this function.
+     *
+     * @param payer   The payer to add or remove.
+     * @param allowed Whether to add or remove the payer.
+     */
+    function updatePayer(address payer, bool allowed) external {
+        // Ensure the sender is only the owner or contract itself.
+        _onlyOwnerOrSelf();
+
+        if (payer == address(0)) {
+            revert PayerCannotBeZeroAddress();
+        }
+
+        // Track the enumerated storage.
+        address[] storage enumeratedStorage = _enumeratedPayers[msg.sender];
+        mapping(address => bool) storage payersMap = _allowedPayers[msg.sender];
+
+        if (allowed) {
+            if (payersMap[payer]) {
+                revert DuplicatePayer();
+            }
+            payersMap[payer] = true;
+            enumeratedStorage.push(payer);
+        } else {
+            if (!payersMap[payer]) {
+                revert PayerNotPresent();
+            }
+            delete _allowedPayers[msg.sender][payer];
+            _removeFromEnumeration(payer, enumeratedStorage);
+        }
+
+        // Emit an event with the update.
+        emit PayerUpdated(msg.sender, payer, allowed);
+    }
+
+    /**
+     * @notice Remove an address from a supplied enumeration.
+     *
+     * @param toRemove    The address to remove.
+     * @param enumeration The enumerated addresses to parse.
+     */
+    function _removeFromEnumeration(
+        address toRemove,
+        address[] storage enumeration
+    ) internal {
+        // Cache the length.
+        uint256 enumerationLength = enumeration.length;
+        for (uint256 i = 0; i < enumerationLength; ) {
+            // Check if the enumerated element is the one we are deleting.
+            if (enumeration[i] == toRemove) {
+                // Swap with the last element.
+                enumeration[i] = enumeration[enumerationLength - 1];
+                // Delete the (now duplicated) last element.
+                enumeration.pop();
+                // Exit the loop.
+                break;
+            }
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Verify an EIP-712 signature by recreating the data structure
+     *         that we signed on the client side, and then using that to recover
+     *         the address that signed the signature for this data.
+     *
+     * @param minter       The mint recipient.
+     * @param feeRecipient The fee recipient.
+     * @param mintParams   The mint params.
+     * @param salt         The salt for the signed mint.
+     */
+    function _getDigest(
+        address minter,
+        address feeRecipient,
+        MintParams memory mintParams,
+        uint256 salt
+    ) internal view returns (bytes32 digest) {
+        bytes32 mintParamsHashStruct = keccak256(
+            abi.encode(
+                _MINT_PARAMS_TYPEHASH,
+                mintParams.mintPrice,
+                mintParams.paymentToken,
+                mintParams.maxTotalMintableByWallet,
+                mintParams.startTime,
+                mintParams.endTime,
+                mintParams.dropStageIndex,
+                mintParams.maxTokenSupplyForStage,
+                mintParams.feeBps,
+                mintParams.restrictFeeRecipients
+            )
+        );
+        digest = keccak256(
+            bytes.concat(
+                bytes2(0x1901),
+                _domainSeparator(),
+                keccak256(
+                    abi.encode(
+                        _SIGNED_MINT_TYPEHASH,
+                        minter,
+                        feeRecipient,
+                        mintParamsHashStruct,
+                        salt
+                    )
+                )
+            )
+        );
+    }
+
+    /**
+     * @dev Internal pure function to cast a `bool` value to a `uint256` value.
+     *
+     * @param b The `bool` value to cast.
+     *
+     * @return u The `uint256` value.
+     */
+    function _cast(bool b) internal pure returns (uint256 u) {
+        assembly {
+            u := b
+        }
+    }
+}
