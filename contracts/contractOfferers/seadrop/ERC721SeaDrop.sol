@@ -514,36 +514,36 @@ contract ERC721SeaDrop is
                 mintParams,
                 proof
             );
-        } /* else if (substandard == 2) {
-                // 2: Token gated mint
-                TokenGatedMintParams memory mintParams = abi.decode(
-                    context[42:100],
-                    (TokenGatedMintParams)
-                );
-                consideration = _mintAllowedTokenHolder(
-                    feeRecipient,
-                    fulfiller,
-                    minter,
-                    mintParams
-                );
-            } else if (substandard == 3) {
-                // 3: Signed mint
-                MintParams memory mintParams = abi.decode(
-                    context[42:100],
-                    (MintParams)
-                );
-                uint256 salt = uint256(bytes32(context[100:132]));
-                bytes memory signature = context[132:];
-                consideration = _mintSigned(
-                    feeRecipient,
-                    fulfiller,
-                    minter,
-                    quantity,
-                    mintParams,
-                    salt,
-                    signature
-                );
-            }*/
+        } else if (substandard == 2) {
+            // 2: Token gated mint
+            TokenGatedMintParams memory mintParams = abi.decode(
+                context[42:],
+                (TokenGatedMintParams)
+            );
+            consideration = _validateMintAllowedTokenHolder(
+                feeRecipient,
+                fulfiller,
+                minter,
+                mintParams
+            );
+        } else if (substandard == 3) {
+            // 3: Signed mint
+            MintParams memory mintParams = abi.decode(
+                context[42:330],
+                (MintParams)
+            );
+            uint256 salt = uint256(bytes32(context[330:362]));
+            bytes memory signature = context[362:];
+            (consideration, ) = _validateMintSigned(
+                feeRecipient,
+                fulfiller,
+                minter,
+                quantity,
+                mintParams,
+                salt,
+                signature
+            );
+        }
     }
 
     /**
@@ -629,36 +629,57 @@ contract ERC721SeaDrop is
                 mintParams,
                 proof
             );
-        } /* else if (substandard == 2) {
-                // 2: Token gated mint
-                TokenGatedMintParams memory mintParams = abi.decode(
-                    context[42:100],
-                    (TokenGatedMintParams)
-                );
-                consideration = _mintAllowedTokenHolder(
-                    feeRecipient,
-                    fulfiller,
-                    minter,
-                    mintParams
-                );
-            } else if (substandard == 3) {
-                // 3: Signed mint
-                MintParams memory mintParams = abi.decode(
-                    context[42:100],
-                    (MintParams)
-                );
-                uint256 salt = uint256(bytes32(context[100:132]));
-                bytes memory signature = context[132:];
-                consideration = _mintSigned(
-                    feeRecipient,
-                    fulfiller,
-                    minter,
-                    quantity,
-                    mintParams,
-                    salt,
-                    signature
-                );
-            }*/
+        } else if (substandard == 2) {
+            // 2: Token gated mint
+            TokenGatedMintParams memory mintParams = abi.decode(
+                context[42:],
+                (TokenGatedMintParams)
+            );
+            // Checks
+            consideration = _validateMintAllowedTokenHolder(
+                feeRecipient,
+                fulfiller,
+                minter,
+                mintParams
+            );
+            // Effects
+            _mintAllowedTokenHolder(
+                feeRecipient,
+                fulfiller,
+                minter,
+                mintParams
+            );
+        } else if (substandard == 3) {
+            // 3: Signed mint
+            MintParams memory mintParams = abi.decode(
+                context[42:330],
+                (MintParams)
+            );
+            uint256 salt = uint256(bytes32(context[330:362]));
+            bytes memory signature = context[362:];
+            bytes32 digest;
+            // Checks
+            (consideration, digest) = _validateMintSigned(
+                feeRecipient,
+                fulfiller,
+                minter,
+                quantity,
+                mintParams,
+                salt,
+                signature
+            );
+            // Effects
+            _mintSigned(
+                feeRecipient,
+                fulfiller,
+                minter,
+                quantity,
+                mintParams,
+                salt,
+                signature,
+                digest
+            );
+        }
     }
 
     /**
@@ -849,7 +870,7 @@ contract ERC721SeaDrop is
     }
 
     /**
-     * @notice Mint with a server-side signature.
+     * @notice Validate minting with a server-side signature.
      *         Note that a signature can only be used once.
      *
      * @param feeRecipient The fee recipient.
@@ -861,7 +882,7 @@ contract ERC721SeaDrop is
      * @param signature    The server-side signature, must be an allowed
      *                     signer.
      */
-    function _mintSigned(
+    function _validateMintSigned(
         address feeRecipient,
         address payer,
         address minter,
@@ -869,7 +890,11 @@ contract ERC721SeaDrop is
         MintParams memory mintParams,
         uint256 salt,
         bytes memory signature
-    ) internal returns (ReceivedItem[] memory consideration) {
+    )
+        internal
+        view
+        returns (ReceivedItem[] memory consideration, bytes32 digest)
+    {
         // Check that the drop stage is active.
         _checkActive(mintParams.startTime, mintParams.endTime);
 
@@ -900,15 +925,12 @@ contract ERC721SeaDrop is
         // Validate the signature in a block scope to avoid "stack too deep".
         {
             // Get the digest to verify the EIP-712 signature.
-            bytes32 digest = _getDigest(minter, feeRecipient, mintParams, salt);
+            digest = _getDigest(minter, feeRecipient, mintParams, salt);
 
             // Ensure the digest has not already been used.
             if (_usedDigests[digest]) {
                 revert SignatureAlreadyUsed();
             }
-
-            // Mark the digest as used.
-            _usedDigests[digest] = true;
 
             // Use the recover method to see what address was used to create
             // the signature on this data.
@@ -926,6 +948,33 @@ contract ERC721SeaDrop is
             feeRecipient,
             mintParams.feeBps
         );
+    }
+
+    /**
+     * @notice Effects for minting with a server-side signature.
+     *         Note that a signature can only be used once.
+     *
+     * @param feeRecipient The fee recipient.
+     * @param payer        The payer of the mint.
+     * @param minter       The mint recipient.
+     * @param quantity     The number of tokens to mint.
+     * @param mintParams   The mint parameters.
+     * @param salt         The salt for the signed mint.
+     * @param signature    The server-side signature, must be an allowed
+     *                     signer.
+     */
+    function _mintSigned(
+        address feeRecipient,
+        address payer,
+        address minter,
+        uint256 quantity,
+        MintParams memory mintParams,
+        uint256 salt,
+        bytes memory signature,
+        bytes32 digest
+    ) internal {
+        // Mark the digest as used.
+        _usedDigests[digest] = true;
 
         // Emit an event for the mint, for analytics.
         _emitSeaDropMint(
@@ -1040,21 +1089,19 @@ contract ERC721SeaDrop is
     }
 
     /**
-     * @notice Mint as an allowed token holder.
-     *         This will mark the token ids as redeemed and will revert if the
-     *         same token id is attempted to be redeemed twice.
+     * @notice Validate mint as an allowed token holder.
      *
      * @param feeRecipient The fee recipient.
      * @param payer        The payer of the mint.
      * @param minter       The mint recipient.
      * @param mintParams   The token gated mint params.
      */
-    function _mintAllowedTokenHolder(
+    function _validateMintAllowedTokenHolder(
         address feeRecipient,
         address payer,
         address minter,
         TokenGatedMintParams memory mintParams
-    ) internal returns (ReceivedItem[] memory consideration) {
+    ) internal view returns (ReceivedItem[] memory consideration) {
         // Ensure the payer is allowed if not the minter.
         if (payer != minter) {
             if (
@@ -1068,7 +1115,7 @@ contract ERC721SeaDrop is
         // Put the allowedNftToken on the stack for more efficient access.
         address allowedNftToken = mintParams.allowedNftToken;
 
-        // Set the dropStage to a variable.
+        // Put the drop stage on the stack.
         TokenGatedDropStage memory dropStage = _tokenGatedDrops[
             allowedNftToken
         ];
@@ -1125,9 +1172,6 @@ contract ERC721SeaDrop is
                 );
             }
 
-            // Increase mint count on redeemed token id.
-            redeemedTokenIds[tokenId] += amount;
-
             // Add to the total mint quantity.
             totalMintQuantity += amount;
 
@@ -1152,6 +1196,58 @@ contract ERC721SeaDrop is
             feeRecipient,
             dropStage.feeBps
         );
+    }
+
+    /**
+     * @notice Effects for minting as an allowed token holder.
+     *
+     * @param feeRecipient The fee recipient.
+     * @param payer        The payer of the mint.
+     * @param minter       The mint recipient.
+     * @param mintParams   The token gated mint params.
+     */
+    function _mintAllowedTokenHolder(
+        address feeRecipient,
+        address payer,
+        address minter,
+        TokenGatedMintParams memory mintParams
+    ) internal returns (ReceivedItem[] memory consideration) {
+        // Put the allowedNftToken on the stack for more efficient access.
+        address allowedNftToken = mintParams.allowedNftToken;
+
+        // Put the drop stage on the stack.
+        TokenGatedDropStage memory dropStage = _tokenGatedDrops[
+            allowedNftToken
+        ];
+
+        // Put the length on the stack for more efficient access.
+        uint256 allowedNftTokenIdsLength = mintParams.allowedNftTokenIds.length;
+
+        // Track the total number of mints requested.
+        uint256 totalMintQuantity;
+
+        // Iterate through each allowedNftTokenId and increase minted count
+        for (uint256 i = 0; i < allowedNftTokenIdsLength; ) {
+            // Put the tokenId on the stack.
+            uint256 tokenId = mintParams.allowedNftTokenIds[i];
+
+            // Put the amount on the stack.
+            uint256 amount = mintParams.amounts[i];
+
+            // Cache the storage pointer for cheaper access.
+            mapping(uint256 => uint256)
+                storage redeemedTokenIds = _tokenGatedRedeemed[allowedNftToken];
+
+            // Increase mint count on redeemed token id.
+            redeemedTokenIds[tokenId] += amount;
+
+            // Add to the total mint quantity.
+            totalMintQuantity += amount;
+
+            unchecked {
+                ++i;
+            }
+        }
 
         // Emit an event for the mint, for analytics.
         _emitSeaDropMint(

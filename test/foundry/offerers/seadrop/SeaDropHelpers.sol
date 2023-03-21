@@ -47,11 +47,6 @@ contract SeaDropHelpers is
     /// @dev SeaDrop doesn't use criteria resolvers.
     CriteriaResolver[] internal criteriaResolvers;
 
-    /// @dev The magic ConsiderationItem address to specify a consecutive mint.
-    address
-        internal constant _CONSECUTIVE_MINT_ERC1155_CONSIDERATION_ITEM_MAGIC_ADDRESS =
-        address(uint160(0xffff << 144));
-
     /// @dev Token contract addresses to ignore for fuzzing.
     address[9] ignoredTokenContracts = [
         address(token1),
@@ -64,6 +59,58 @@ contract SeaDropHelpers is
         address(test1155_2),
         address(test1155_3)
     ];
+
+    /// @notice Internal constants for EIP-712: Typed structured
+    ///         data hashing and signing
+    bytes32 internal constant _SIGNED_MINT_TYPEHASH =
+        // prettier-ignore
+        keccak256(
+             "SignedMint("
+                "address minter,"
+                "address feeRecipient,"
+                "MintParams mintParams,"
+                "uint256 salt"
+            ")"
+            "MintParams("
+                "uint256 mintPrice,"
+                "address paymentToken,"
+                "uint256 maxTotalMintableByWallet,"
+                "uint256 startTime,"
+                "uint256 endTime,"
+                "uint256 dropStageIndex,"
+                "uint256 maxTokenSupplyForStage,"
+                "uint256 feeBps,"
+                "bool restrictFeeRecipients"
+            ")"
+        );
+    bytes32 internal constant _MINT_PARAMS_TYPEHASH =
+        // prettier-ignore
+        keccak256(
+            "MintParams("
+                "uint256 mintPrice,"
+                "address paymentToken,"
+                "uint256 maxTotalMintableByWallet,"
+                "uint256 startTime,"
+                "uint256 endTime,"
+                "uint256 dropStageIndex,"
+                "uint256 maxTokenSupplyForStage,"
+                "uint256 feeBps,"
+                "bool restrictFeeRecipients"
+            ")"
+        );
+    bytes32 internal constant _EIP_712_DOMAIN_TYPEHASH =
+        // prettier-ignore
+        keccak256(
+            "EIP712Domain("
+                "string name,"
+                "string version,"
+                "uint256 chainId,"
+                "address verifyingContract"
+            ")"
+        );
+    bytes32 internal constant _NAME_HASH = keccak256("ERC721SeaDrop");
+    bytes32 internal constant _VERSION_HASH = keccak256("2.0");
+    uint256 internal immutable _CHAIN_ID = block.chainid;
 
     function setUp() public virtual override {
         super.setUp();
@@ -157,6 +204,64 @@ contract SeaDropHelpers is
         assertTrue(verified);
     }
 
+    function getSignedMint(
+        string memory signerName,
+        address seadrop,
+        address minter,
+        address feeRecipient,
+        MintParams memory mintParams,
+        uint256 salt
+    ) internal returns (bytes memory signature) {
+        bytes32 digest = _getDigest(
+            seadrop,
+            minter,
+            feeRecipient,
+            mintParams,
+            salt
+        );
+        (, uint256 pk) = makeAddrAndKey(signerName);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        signature = abi.encodePacked(r, s, v);
+    }
+
+    function _getDigest(
+        address seadrop,
+        address minter,
+        address feeRecipient,
+        MintParams memory mintParams,
+        uint256 salt
+    ) internal view returns (bytes32 digest) {
+        bytes32 mintParamsHashStruct = keccak256(
+            abi.encode(
+                _MINT_PARAMS_TYPEHASH,
+                mintParams.mintPrice,
+                mintParams.paymentToken,
+                mintParams.maxTotalMintableByWallet,
+                mintParams.startTime,
+                mintParams.endTime,
+                mintParams.dropStageIndex,
+                mintParams.maxTokenSupplyForStage,
+                mintParams.feeBps,
+                mintParams.restrictFeeRecipients
+            )
+        );
+        digest = keccak256(
+            bytes.concat(
+                bytes2(0x1901),
+                _deriveDomainSeparator(seadrop),
+                keccak256(
+                    abi.encode(
+                        _SIGNED_MINT_TYPEHASH,
+                        minter,
+                        feeRecipient,
+                        mintParamsHashStruct,
+                        salt
+                    )
+                )
+            )
+        );
+    }
+
     /**
      * Order helpers
      */
@@ -207,5 +312,20 @@ contract SeaDropHelpers is
         });
         baseOrderParameters.orderType = OrderType.CONTRACT;
         configureOrderComponents(0);
+    }
+
+    function _deriveDomainSeparator(
+        address seadrop
+    ) internal view returns (bytes32) {
+        // prettier-ignore
+        return keccak256(
+            abi.encode(
+                _EIP_712_DOMAIN_TYPEHASH,
+                _NAME_HASH,
+                _VERSION_HASH,
+                block.chainid,
+                seadrop
+            )
+        );
     }
 }
